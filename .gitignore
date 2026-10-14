@@ -1,0 +1,26 @@
+# 只版本化**源码与文档**；编译产物与本地缓存不入库。
+# 依据：仓库既有跟踪清单里从来没有 .ex5 / 日志（见 git ls-files）。
+
+# MetaEditor 编译产物
+*.ex5
+
+# 编译日志（Indictor/compile*.log 等）
+compile*.log
+
+# CodeBuddy / 编辑器缓存
+.codebuddy/
+
+# 临时导出（事件 CSV 由指标写到 MT5 的 MQL5\Files，不在仓库内；
+# 若有人手动拷进仓库，用下面的规则挡住）
+/Structure_events_*.csv
+/Structure_snap_*.png
+# 发布产物：不进仓库，走 GitHub Release 发布
+/dist/
+# 非仓库内容：本地工具与素材，不入库（保持 git status 干净）
+/llm_fit_check/
+/dshfix/
+/tools/
+/docs/guide/
+/docs/img/
+/docs/research/img/
+/docs/audit-*.md

@@ -1,0 +1,628 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════
+//  TradFi_Structure —— Mine Script v6 移植版
+//
+//  源逻辑：Indictor/TradFi_Structure.mq5 v1.47（口径 v1.37 / v1.38 / v1.39）
+//  功能：市场结构（ICT）—— fractal swing 折线 + BOS/MSS 事件标注 + 内包盒
+//
+//  ── 移植差异（务必先读）──────────────────────────────────────────
+//   1. MQL5 每 tick 全量重算 + 窗口截断；Mine Script 逐 bar 事件驱动。
+//      故本移植改为「增量状态机」：每个 bar 收盘执行一次，状态存 var 变量。
+//      语义与全量重算等价，但因 swing 需要一根 bar 延迟确认，
+//      历史事件在推迟 1 根 bar 时才落图（MQL5 有 nextBar 信息故不延迟）。
+//   2. MQL5 时序列 0 = 最新；Mine bar_index 0 = 最旧（递增）。
+//      所有间隔比较统一用 bar_index 差值，语义等价。
+//   3. MQL5 「内包过滤后的有效 bar 序列」用 old/mid/cur 滚动缓冲在线复现，
+//      而非动态历史偏移（Mine 的 [] 偏移必须是常量/简单整数）。
+//   4. 结构线用 polyline.new() 一篇折线替代 MQL5 的逐段 OBJ_TREND。
+//   5. ATR 用内置 ta.atr(period)（Wilder 平滑），等价 MQL5 CalcATRSeries。
+// ══════════════════════════════════════════════════════════════════
+
+indicator("TradFi Structure", overlay = true)
+
+// ── 输入参数（对应 MQL5 的 input group）────────────────────────────
+grpMode = "== 结构模式 =="
+modeInput = input.string("ShortTerm", "结构模式",
+     options = ["FractalSwing", "ShortTerm", "StrictICT"], group = grpMode)
+
+grpMark = "== 结构标记设置 =="
+showMSSInput = input.bool(true, "显示 MSS 标注", group = grpMark)
+showBOSInput = input.bool(true, "显示 BOS 标注", group = grpMark)
+
+grpFilt = "== 有效回撤过滤 =="
+enableRetraceInput = input.bool(true, "启用有效回撤过滤", group = grpFilt)
+minRetracePtsInput = input.int(100, "最小回撤点数 (points)", minval = 0, group = grpFilt)
+minRetraceATRInput = input.float(0.5, "最小回撤 ATR 倍数", minval = 0.0, step = 0.1, group = grpFilt)
+minRetraceRatioInput = input.float(0.236, "最小回撤占前段幅度比例", minval = 0.0, step = 0.001, group = grpFilt)
+atrPeriodInput = input.int(14, "ATR 周期", minval = 2, group = grpFilt)
+minSwingAmpInput = input.int(0, "最小 swing 幅度 (points, 0=关闭)", minval = 0, group = grpFilt)
+minBarsBetweenInput = input.int(2, "相邻 swing 最小间隔 (根数)", minval = 0, group = grpFilt)
+
+grpMain = "== 主/内部结构 =="
+useMainFilterInput = input.bool(true, "启用主结构过滤", group = grpMain)
+mainFilterATRInput = input.float(1.0, "主结构腿长门槛 (ATR 倍数)", minval = 0.0, step = 0.1, group = grpMain)
+mainFilterRatioInput = input.float(0.382, "主结构腿长占前段比例门槛", minval = 0.0, step = 0.001, group = grpMain)
+
+grpBox = "== 内包盒 =="
+useInsideBoxInput = input.bool(true, "记录内包盒区间", group = grpBox)
+drawInsideBoxInput = input.bool(true, "绘制内包盒矩形", group = grpBox)
+
+grpConfirm = "== 突破确认 =="
+closeConfirmInput = input.bool(false, "收盘突破确认 (false=影线即确认)", group = grpConfirm)
+
+grpDraw = "== BOS/MSS 绘制 =="
+drawLiveLegInput = input.bool(true, "结构线延伸至当前未确认端点", group = grpDraw)
+lineEndInput = input.string("突破K线", "虚线终点模式",
+     options = ["突破K线", "固定N根", "首次回踩"], group = grpDraw)
+lineEndBarsInput = input.int(20, "固定终点长度 (根数)", minval = 0, group = grpDraw)
+maxEventsInput = input.int(6, "每类各只显示最近 N 条 (0=全部)", minval = 0, group = grpDraw)
+debugRefInput = input.bool(false, "标签显示 refBar/refPrice (调试)", group = grpDraw)
+
+grpColor = "== 颜色 =="
+colorStructureInput = input.color(color.rgb(57, 197, 207), "结构线颜色 (ZigZag 青)", group = grpColor)
+colorMSSInput = input.color(color.rgb(255, 213, 79), "MSS 标注颜色 (黄)", group = grpColor)
+colorBOSInput = input.color(color.rgb(255, 82, 82), "BOS 标注颜色 (红)", group = grpColor)
+colorBoxInput = input.color(color.rgb(110, 110, 130), "内包盒矩形颜色", group = grpColor)
+
+// ── 派生开关 ──────────────────────────────────────────────────────
+isFractal = modeInput == "FractalSwing"
+isStrict = modeInput == "StrictICT"
+// 过滤仅在非 FractalSwing 模式生效（对应 MQL5 InpMode != MODE_FRACTAL_SWING）
+applyRetrace = (enableRetraceInput or minSwingAmpInput > 0) and not isFractal
+closeConfirm = closeConfirmInput or isStrict
+// 输入参数为点数（MQL5 _Point）；Mine 无 _Point，用最小价格变动近似
+pt = syminfo.mintick
+
+// ATR（Wilder 平滑，等价 MQL5 CalcATRSeries）。必须全局调用以保证历史连续
+atrValue = ta.atr(atrPeriodInput)
+
+// ══════════════════════════════════════════════════════════════════
+//  持久状态（var：仅首根 bar 初始化，跨 bar 保留，等价 MQL5 struct SState）
+// ══════════════════════════════════════════════════════════════════
+var int trend = 0              //  1=UP / -1=DOWN / 0=未播种
+
+var float refHighPrice = na    // UP=HH / DOWN=LH
+var int   refHighBar = -1
+var bool  refHighValid = false
+var bool  refHighBroken = false
+
+var float refLowPrice = na     // UP=HL / DOWN=LL
+var int   refLowBar = -1
+var bool  refLowValid = false
+var bool  refLowBroken = false
+
+var int   lastIsHigh = -1      // -1=无节点 / 1=最后节点是高点 / 0=低点
+var float lastLeg = 0.0        // 最后一条已确认腿幅度（比例过滤用）
+
+// ── 内包过滤后的「有效 bar 序列」滚动缓冲 ──
+// 等价 MQL5 的 validBars[]。因 Mine 的 [] 偏移必须是常量/简单整数，故把每根
+// 有效 bar 的极值「值」一并存下，避免任何 high[series] 动态偏移：
+//   cur  = 本 bar（有效时其值即 high/low，无需存储）
+//   mid  = fractal 中心候选（需延迟一根 bar 确认 → 存下其值）
+//   old  = 中心点的更旧邻居（fractal 比较基准 → 存下其值）
+var bool curIsHigh = false     // 本 bar 打破母线高
+var bool curIsLow = false      // 本 bar 打破母线低
+
+var int midBar = -1
+var float midHigh = na
+var float midLow = na
+var bool midIsHigh = false
+var bool midIsLow = false
+
+var int oldBar = -1
+var float oldHigh = na
+var float oldLow = na
+
+var int motherBar = -1         // 当前母线（分析起点 / 内包判定基准）
+var int boxStartBar = -1       // 当前母线内部最旧内包
+var int boxEndBar = -1         // 当前母线内部最新内包
+
+// ── 结果集合（对应 MQL5 StructureResult）──────────────────────────
+var array<int> nodeBar = array.new_int()
+var array<float> nodePrice = array.new_float()
+var array<bool> nodeIsHigh = array.new_bool()
+var array<bool> nodeIsMain = array.new_bool()
+
+var array<int> mssBar = array.new_int()
+var array<int> mssRefBar = array.new_int()
+var array<float> mssRefPrice = array.new_float()
+var array<int> mssDir = array.new_int()
+
+var array<int> bosBar = array.new_int()
+var array<int> bosRefBar = array.new_int()
+var array<float> bosRefPrice = array.new_float()
+var array<int> bosDir = array.new_int()
+
+var array<int> boxMotherBar = array.new_int()
+var array<int> boxStartArr = array.new_int()
+var array<int> boxEndArr = array.new_int()
+var array<float> boxHiArr = array.new_float()
+var array<float> boxLoArr = array.new_float()
+
+// ── 绘图对象句柄 ──────────────────────────────────────────────────
+var polyline zigzagLine = na
+var array<chart.point> zigzagPts = array.new<chart.point>()
+var int drawnNodeCount = -1
+var int drawnLastNodeBar = -1
+var line liveLeg = na
+var box insideBox = na
+var int drawnBoxCount = -1
+var int drawnMSS = 0
+var int drawnBOS = 0
+
+// ══════════════════════════════════════════════════════════════════
+//  纯函数
+// ══════════════════════════════════════════════════════════════════
+
+// 从最后一个结构节点到本 swing 的腿长（对应 MQL5 LegFromLastNode）
+legFromLastNode(float price, bool isHigh) =>
+    float res = 1e12
+    int n = array.size(nodeBar)
+    if n > 0
+        float refPrice = array.get(nodePrice, n - 1)
+        bool lastHigh = array.get(nodeIsHigh, n - 1)
+        if isHigh != lastHigh
+            refPrice := array.get(nodePrice, n - 1)
+        else if n >= 2
+            refPrice := array.get(nodePrice, n - 2)
+        else
+            refPrice := array.get(nodePrice, 0)
+        res := isHigh ? (price - refPrice) : (refPrice - price)
+    res
+
+// 有效回撤 / 最小 swing 幅度过滤（对应 MQL5 IsValidRetrace）
+isValidRetrace(float leg, float atrNow, float prevLeg) =>
+    bool ok = true
+    if enableRetraceInput or minSwingAmpInput > 0
+        if minSwingAmpInput > 0 and leg < minSwingAmpInput * pt
+            ok := false
+        else if enableRetraceInput
+            if minRetracePtsInput > 0 and leg < minRetracePtsInput * pt
+                ok := false
+            else
+                bool atrOk = minRetraceATRInput <= 0.0 or na(atrNow) or atrNow <= 0.0 or leg >= minRetraceATRInput * atrNow
+                bool ratioOk = minRetraceRatioInput <= 0.0 or prevLeg <= 0.0 or leg >= minRetraceRatioInput * prevLeg
+                bool hasT = (minRetraceATRInput > 0.0 and not na(atrNow) and atrNow > 0.0) or (minRetraceRatioInput > 0.0 and prevLeg > 0.0)
+                if hasT and not (atrOk or ratioOk)
+                    ok := false
+    ok
+
+// 主结构判定（对应 MQL5 IsMainSwing）
+isMainSwing(float leg, float atrNow, float prevLeg) =>
+    bool ok = true
+    if useMainFilterInput
+        ok := false
+        if mainFilterATRInput > 0.0 and not na(atrNow) and atrNow > 0.0 and leg >= mainFilterATRInput * atrNow
+            ok := true
+        if mainFilterRatioInput > 0.0 and prevLeg > 0.0 and leg >= mainFilterRatioInput * prevLeg
+            ok := true
+    ok
+
+// 突破是否成立（对应 MQL5 CloseConfirm 分支：收盘确认 or 影线即确认）
+breakUp(float lvl) =>
+    closeConfirm ? close > lvl : high > lvl
+
+breakDown(float lvl) =>
+    closeConfirm ? close < lvl : low < lvl
+
+// ══════════════════════════════════════════════════════════════════
+//  绘图
+// ══════════════════════════════════════════════════════════════════
+
+// 结构线折线：节点集合变化才重建（替代 MQL5 逐段 OBJ_TREND + 调和同步）
+rebuildZigzag() =>
+    if not na(zigzagLine)
+        polyline.delete(zigzagLine)
+        zigzagLine := na
+    int n = array.size(nodeBar)
+    if n >= 2
+        array.clear(zigzagPts)
+        int startIdx = n > 500 ? n - 500 : 0
+        for i = startIdx to n - 1
+            array.push(zigzagPts, chart.point.from_index(array.get(nodeBar, i), array.get(nodePrice, i)))
+        zigzagLine := polyline.new(zigzagPts, false, false, xloc.bar_index,
+             colorStructureInput, na, line.style_solid, 1)
+    drawnNodeCount := n
+    drawnLastNodeBar := n > 0 ? array.get(nodeBar, n - 1) : -1
+
+// 内包盒：始终只维护最新一个（等价 MQL5 的 Box_<motherBar> 矩形）
+rebuildInsideBox() =>
+    int n = array.size(boxMotherBar)
+    if n > 0
+        int m = array.get(boxMotherBar, n - 1)
+        int s = array.get(boxStartArr, n - 1)
+        int e = array.get(boxEndArr, n - 1)
+        float hi = array.get(boxHiArr, n - 1)
+        float lo = array.get(boxLoArr, n - 1)
+        if na(insideBox)
+            insideBox := box.new(m, hi, e, lo, border_color = colorBoxInput,
+                 border_width = 1, border_style = line.style_dotted,
+                 bgcolor = color.new(colorBoxInput, 100))
+        else
+            box.set_lefttop(insideBox, m, hi)
+            box.set_rightbottom(insideBox, e, lo)
+    drawnBoxCount := n
+
+// BOS/MSS 水平虚线 + 方向感知标签（对应 MQL5 UpsertLine + UpsertText）
+// 线画在「被突破结构位」refPrice，从 refBar 起到终点 bar；标签在 breakBar
+drawEvent(int dir, float base, int rBar, int bBar, bool isMSS) =>
+    int endBar = bBar
+    if lineEndInput == "固定N根"
+        endBar := int(math.max(bBar - lineEndBarsInput, 0))
+    else if lineEndInput == "首次回踩"
+        endBar := -1
+        int jLimit = int(math.max(bBar - lineEndBarsInput, 0))
+        int age = bar_index - (bBar - 1)
+        for j = bBar - 1 to jLimit
+            if (dir == 1 and low[age] <= base) or (dir == -1 and high[age] >= base)
+                endBar := j
+                break
+            age := age + 1
+        if endBar < 0
+            endBar := jLimit
+    clr = isMSS ? colorMSSInput : colorBOSInput
+    if rBar >= 0 and endBar >= rBar
+        line.new(rBar, base, endBar, base, xloc.bar_index, extend.none, clr, line.style_dashed, 1)
+        float off = na(atrValue) ? 0.0 : atrValue * 0.15
+        float labelPrice = dir == 1 ? base + off : base - off
+        string tag = isMSS ? "MSS" : "BOS"
+        if debugRefInput
+            tag := (isMSS ? "MSS #" : "BOS #") + str.tostring(rBar) + " " + str.tostring(base)
+        label.new(bBar, labelPrice, tag, xloc = xloc.bar_index, style = label.style_label_down,
+             color = color.new(clr, 85), textcolor = clr, size = size.small)
+
+// ══════════════════════════════════════════════════════════════════
+//  主状态机：每根 bar 收盘执行一次
+// ══════════════════════════════════════════════════════════════════
+// 本 bar 是否发生 MSS（用于 v1.37：MSS 当 bar 不用 swing 回填反向 ref）
+mssWasBearish = false
+mssWasBullish = false
+
+if barstate.isconfirmed
+    // ── 0. 播种第一根母线 ──
+    if motherBar < 0
+        motherBar := bar_index
+
+    // ── 1. 内包过滤（等价 MQL5 validBars 构建阶段）──
+    //     注：Mine 的 [] 偏移必须是常量，故母线值直接用 high[1]/low[1]
+    //     （上一根 bar 恒为当前母线，因为有效 bar 一到就成为新母线）
+    if bar_index >= 1
+        float mHigh = high[1]
+        float mLow = low[1]
+        bool isInside = high <= mHigh and low >= mLow
+
+        if isInside
+            // 内包：不参与 swing 检测，仅记录盒区间
+            if boxStartBar < 0
+                boxStartBar := bar_index
+            boxEndBar := bar_index
+        else
+            // 打破母线高/低 → 本 bar 成为有效 bar
+            // 若中间存在内包段，记录盒（母线 high/low + 内包起止）
+            if boxStartBar >= 0
+                array.push(boxMotherBar, motherBar)
+                array.push(boxStartArr, boxStartBar)
+                array.push(boxEndArr, boxEndBar)
+                array.push(boxHiArr, mHigh)
+                array.push(boxLoArr, mLow)
+                boxStartBar := -1
+                boxEndBar := -1
+
+            bool curIsHigh = high > mHigh
+            bool curIsLow = low < mLow
+
+            // ── 2. A2：通用结构突破检测（BOS/MSS 唯一触发源，v1.37）──
+            //     不依赖本 bar 是否确认成 swing；触发即标 broken、MSS 立即切向
+            if trend == 1
+                bool upBroken = refHighValid and not refHighBroken and breakUp(refHighPrice)
+                bool dnBroken = refLowValid and not refLowBroken and breakDown(refLowPrice)
+                if upBroken and dnBroken
+                    // 外包形态双破：阳线保留 BOS(上破)，阴线保留 MSS(下破)
+                    if close >= open
+                        array.push(bosBar, bar_index)
+                        array.push(bosRefBar, refHighBar)
+                        array.push(bosRefPrice, refHighPrice)
+                        array.push(bosDir, 1)
+                        refHighBroken := true
+                    else
+                        array.push(mssBar, bar_index)
+                        array.push(mssRefBar, refLowBar)
+                        array.push(mssRefPrice, refLowPrice)
+                        array.push(mssDir, -1)
+                        refLowBroken := true
+                        trend := -1
+                        refHighValid := false
+                        mssWasBearish := true
+                else if upBroken
+                    array.push(bosBar, bar_index)
+                    array.push(bosRefBar, refHighBar)
+                    array.push(bosRefPrice, refHighPrice)
+                    array.push(bosDir, 1)
+                    refHighBroken := true
+                else if dnBroken
+                    array.push(mssBar, bar_index)
+                    array.push(mssRefBar, refLowBar)
+                    array.push(mssRefPrice, refLowPrice)
+                    array.push(mssDir, -1)
+                    refLowBroken := true
+                    trend := -1
+                    refHighValid := false
+                    mssTriggeredBar := true
+                    mssWasBearish := true
+            else if trend == -1
+                bool upBroken2 = refHighValid and not refHighBroken and breakUp(refHighPrice)
+                bool dnBroken2 = refLowValid and not refLowBroken and breakDown(refLowPrice)
+                if upBroken2 and dnBroken2
+                    // DOWN 中 阳线双破 → 保留 MSS(上破)；阴线 → 保留 BOS(下破)
+                    if close >= open
+                        array.push(mssBar, bar_index)
+                        array.push(mssRefBar, refHighBar)
+                        array.push(mssRefPrice, refHighPrice)
+                        array.push(mssDir, 1)
+                        refHighBroken := true
+                        trend := 1
+                        refLowValid := false
+                        mssWasBullish := true
+                    else
+                        array.push(bosBar, bar_index)
+                        array.push(bosRefBar, refLowBar)
+                        array.push(bosRefPrice, refLowPrice)
+                        array.push(bosDir, -1)
+                        refLowBroken := true
+                else if dnBroken2
+                    array.push(bosBar, bar_index)
+                    array.push(bosRefBar, refLowBar)
+                    array.push(bosRefPrice, refLowPrice)
+                    array.push(bosDir, -1)
+                    refLowBroken := true
+                else if upBroken2
+                    array.push(mssBar, bar_index)
+                    array.push(mssRefBar, refHighBar)
+                    array.push(mssRefPrice, refHighPrice)
+                    array.push(mssDir, 1)
+                    refHighBroken := true
+                    trend := 1
+                    refLowValid := false
+                    mssTriggeredBar := true
+                    mssWasBullish := true
+
+            // ── 3. B：fractal swing 确认（滚动三元组，无动态偏移）──
+            //     等价 MQL5 validBars[k-1] / [k] / [k+1]，此处
+            //     oldBar / midBar / 本 bar 分别对应更旧 / 中点 / 更新
+            bool isSwingHigh = false
+            bool isSwingLow = false
+            if not na(oldHigh)
+                if midIsHigh
+                    isSwingHigh := midHigh > oldHigh and midHigh >= high
+                if midIsLow
+                    isSwingLow := midLow < oldLow and midLow <= low
+
+                // B2：相邻 swing 最小间隔过滤（bar_index 差值，等价 MathAbs）
+                if minBarsBetweenInput > 0 and array.size(nodeBar) > 0
+                    int lastNodeBar = array.get(nodeBar, array.size(nodeBar) - 1)
+                    if math.abs(lastNodeBar - midBar) < minBarsBetweenInput
+                        isSwingHigh := false
+                        isSwingLow := false
+
+                // C：双 swing 互斥裁决（MSS 优先 → BOS → 保持交替）
+                if isSwingHigh and isSwingLow
+                    bool highMSS = trend == -1 and refHighValid and not refHighBroken and midHigh > refHighPrice
+                    bool highBOS = trend == 1 and refHighValid and not refHighBroken and midHigh > refHighPrice
+                    bool lowMSS = trend == 1 and refLowValid and not refLowBroken and midLow < refLowPrice
+                    bool lowBOS = trend == -1 and refLowValid and not refLowBroken and midLow < refLowPrice
+                    bool takeHigh = lastIsHigh != 1
+                    if highMSS or lowMSS
+                        takeHigh := highMSS
+                    else if highBOS or lowBOS
+                        takeHigh := highBOS
+                    if takeHigh
+                        isSwingLow := false
+                    else
+                        isSwingHigh := false
+
+                // D：有效回撤 / 最小 swing 幅度过滤
+                if applyRetrace
+                    if isSwingHigh
+                        float legH = legFromLastNode(midHigh, true)
+                        if not isValidRetrace(legH, atrValue, lastLeg)
+                            isSwingHigh := false
+                    if isSwingLow
+                        float legL = legFromLastNode(midLow, false)
+                        if not isValidRetrace(legL, atrValue, lastLeg)
+                            isSwingLow := false
+
+                // D2：主/内部结构判定（仅影响线型，不阻断结构推进）
+                bool isMainOk = true
+                if useMainFilterInput and not isFractal and trend != 0 and (isSwingHigh or isSwingLow)
+                    float legM = isSwingHigh ? legFromLastNode(midHigh, true) : legFromLastNode(midLow, false)
+                    if not isMainSwing(legM, atrValue, lastLeg)
+                        isMainOk := false
+
+                // ── E：播种 —— 第一个 swing 确定初始方向 ──
+                if trend == 0
+                    if isSwingHigh
+                        trend := 1
+                        refHighBar := midBar
+                        refHighPrice := midHigh
+                        refHighValid := true
+                        refHighBroken := false
+                        array.push(nodeBar, midBar)
+                        array.push(nodePrice, midHigh)
+                        array.push(nodeIsHigh, true)
+                        array.push(nodeIsMain, true)
+                        lastIsHigh := 1
+                        lastLeg := 0.0
+                    else if isSwingLow
+                        trend := -1
+                        refLowBar := midBar
+                        refLowPrice := midLow
+                        refLowValid := true
+                        refLowBroken := false
+                        array.push(nodeBar, midBar)
+                        array.push(nodePrice, midLow)
+                        array.push(nodeIsHigh, false)
+                        array.push(nodeIsMain, true)
+                        lastIsHigh := 0
+                        lastLeg := 0.0
+                else
+                    // ── F：swing 确认 → 添加结构节点 + 更新对应 ref ──
+                    if isSwingHigh
+                        float px = midHigh
+                        bool added = false
+                        int n = array.size(nodeBar)
+                        if lastIsHigh == 1
+                            // 同类型：只保留更极端者，并同步同类型 ref
+                            if px > array.get(nodePrice, n - 1)
+                                int replacedBar = array.get(nodeBar, n - 1)
+                                array.set(nodeBar, n - 1, midBar)
+                                array.set(nodePrice, n - 1, px)
+                                array.set(nodeIsMain, n - 1, isMainOk)
+                                if refHighValid and replacedBar == refHighBar
+                                    refHighBar := midBar
+                                    refHighPrice := px
+                                added := true
+                        else
+                            array.push(nodeBar, midBar)
+                            array.push(nodePrice, px)
+                            array.push(nodeIsHigh, true)
+                            array.push(nodeIsMain, isMainOk)
+                            lastIsHigh := 1
+                            added := true
+                        if added
+                            int nn = array.size(nodeBar)
+                            if nn >= 2
+                                lastLeg := math.abs(array.get(nodePrice, nn - 1) - array.get(nodePrice, nn - 2))
+                            // v1.37：MSS 当 bar 不用本 swing 回填「反向」ref
+                            if isMainOk and not (mssWasBearish and trend == -1)
+                                if trend == 1
+                                    if not refHighValid or refHighBroken or px > refHighPrice
+                                        refHighBar := midBar
+                                        refHighPrice := px
+                                        refHighValid := true
+                                        refHighBroken := false
+                                else
+                                    refHighBar := midBar
+                                    refHighPrice := px
+                                    refHighValid := true
+                                    refHighBroken := false
+                    if isSwingLow
+                        float pxL = midLow
+                        bool addedL = false
+                        int n2 = array.size(nodeBar)
+                        if lastIsHigh == 0
+                            if pxL < array.get(nodePrice, n2 - 1)
+                                int replacedBar2 = array.get(nodeBar, n2 - 1)
+                                array.set(nodeBar, n2 - 1, midBar)
+                                array.set(nodePrice, n2 - 1, pxL)
+                                array.set(nodeIsMain, n2 - 1, isMainOk)
+                                if refLowValid and replacedBar2 == refLowBar
+                                    refLowBar := midBar
+                                    refLowPrice := pxL
+                                addedL := true
+                        else
+                            array.push(nodeBar, midBar)
+                            array.push(nodePrice, pxL)
+                            array.push(nodeIsHigh, false)
+                            array.push(nodeIsMain, isMainOk)
+                            lastIsHigh := 0
+                            addedL := true
+                        if addedL
+                            int nn2 = array.size(nodeBar)
+                            if nn2 >= 2
+                                lastLeg := math.abs(array.get(nodePrice, nn2 - 1) - array.get(nodePrice, nn2 - 2))
+                            // v1.37：MSS 当 bar 不用本 swing 回填「反向」ref
+                            if isMainOk and not (mssWasBullish and trend == 1)
+                                if trend == -1
+                                    if not refLowValid or refLowBroken or pxL < refLowPrice
+                                        refLowBar := midBar
+                                        refLowPrice := pxL
+                                        refLowValid := true
+                                        refLowBroken := false
+                                else
+                                    refLowBar := midBar
+                                    refLowPrice := pxL
+                                    refLowValid := true
+                                    refLowBroken := false
+
+            // ── 4. 滚动推进：本 bar 成为最新有效 bar ──
+            //     等价 MQL5 validBars[]（旧→新）：old ← mid ← cur ← 本 bar
+            //     mid 的「是否打破母线」标记在此一并结转，因为下一根 bar
+            //     到来时它才作为 fractal 中心被评估
+            oldBar := midBar
+            oldHigh := midHigh
+            oldLow := midLow
+            midBar := bar_index
+            midHigh := high
+            midLow := low
+            midIsHigh := curIsHigh
+            midIsLow := curIsLow
+
+            // 本 bar 成为新母线
+            motherBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════
+//  渲染：仅在最后一根 bar 上重建（等价 MQL5 RenderScene + 调和同步）
+// ══════════════════════════════════════════════════════════════════
+// 声明语句要求指标至少有一个图表输出调用，此处兼作趋势状态指示
+plotshape(trend != 0, title = "Trend", style = shape.circle, location = location.top,
+     size = size.tiny, color = trend == 1 ? colorStructureInput : colorMSSInput)
+
+if barstate.islast
+    // ── 结构线：节点集合变化才重建 ──
+    int nNodes = array.size(nodeBar)
+    int lastNB = nNodes > 0 ? array.get(nodeBar, nNodes - 1) : -1
+    if nNodes != drawnNodeCount or lastNB != drawnLastNodeBar
+        rebuildZigzag()
+
+    // ── 实时腿：起点固定 = 最后确认结构点；终点 = 之后的反向极值 ──
+    if drawLiveLegInput and not isFractal and nNodes > 0
+        int lb = array.get(nodeBar, nNodes - 1)
+        float lp = array.get(nodePrice, nNodes - 1)
+        bool lh = array.get(nodeIsHigh, nNodes - 1)
+        if lb < bar_index
+            int extBar = lb + 1
+            int age = bar_index - (lb + 1)
+            float extPrice = lh ? low[age] : high[age]
+            age := age - 1
+            for j = lb + 2 to bar_index
+                if lh
+                    if low[age] < extPrice
+                        extPrice := low[age]
+                        extBar := j
+                else
+                    if high[age] > extPrice
+                        extPrice := high[age]
+                        extBar := j
+                age := age - 1
+            if extBar > lb
+                if na(liveLeg)
+                    liveLeg := line.new(lb, lp, extBar, extPrice, xloc.bar_index, extend.none,
+                         colorStructureInput, line.style_dashed, 1)
+                else
+                    line.set_xy1(liveLeg, lb, lp)
+                    line.set_xy2(liveLeg, extBar, extPrice)
+
+    // ── BOS / MSS：增量绘制（历史当 bar 落图），每类只保留最近 N 条 ──
+    if showMSSInput
+        int nMSS = array.size(mssBar)
+        int fromMSS = maxEventsInput > 0 and nMSS > maxEventsInput ? nMSS - maxEventsInput : 0
+        if nMSS > drawnMSS
+            for k = drawnMSS to nMSS - 1
+                if k >= fromMSS
+                    drawEvent(array.get(mssDir, k), array.get(mssRefPrice, k),
+                         array.get(mssRefBar, k), array.get(mssBar, k), true)
+            drawnMSS := nMSS
+    if showBOSInput
+        int nBOS = array.size(bosBar)
+        int fromBOS = maxEventsInput > 0 and nBOS > maxEventsInput ? nBOS - maxEventsInput : 0
+        if nBOS > drawnBOS
+            for k2 = drawnBOS to nBOS - 1
+                if k2 >= fromBOS
+                    drawEvent(array.get(bosDir, k2), array.get(bosRefPrice, k2),
+                         array.get(bosRefBar, k2), array.get(bosBar, k2), false)
+            drawnBOS := nBOS
+
+    // ── 内包盒：只维护最新一个 ──
+    if useInsideBoxInput and drawInsideBoxInput and not isFractal
+        if array.size(boxMotherBar) != drawnBoxCount
+            rebuildInsideBox()
